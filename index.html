@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Medical Booking Voice Agent</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; max-width: 800px; margin: auto; background: #f8f9fa; }
+        h2 { color: #333; }
+        .controls { margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 6px; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #startBtn { background: #198754; color: white; }
+        #stopBtn { background: #dc3545; color: white; }
+        select { padding: 10px; font-size: 16px; border-radius: 6px; border: 1px solid #ccc; }
+        #chat { border: 1px solid #ddd; padding: 20px; height: 500px; overflow-y: scroll; display: flex; flex-direction: column; gap: 10px; background: white; border-radius: 8px; }
+        .bubble { padding: 12px 16px; border-radius: 8px; max-width: 75%; line-height: 1.4; word-wrap: break-word; }
+        .user { background-color: #d1e7dd; align-self: flex-end; }
+        .ai { background-color: #e2e3e5; align-self: flex-start; }
+        .tool-card {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            align-self: flex-start;
+            max-width: 80%;
+        }
+        .tool-header { font-weight: bold; margin-bottom: 4px; color: #664d03; }
+        .tool-detail { color: #555; font-size: 12px; }
+        .tool-latency { color: #999; font-size: 11px; margin-top: 4px; }
+        .latency-bar {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            color: #0f0;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Medical Booking Voice Agent</h2>
+    <div class="controls">
+        <select id="langSelect">
+            <option value="en">English</option>
+            <option value="hi">Hindi</option>
+            <option value="ta">Tamil</option>
+        </select>
+        <button id="startBtn">Start Recording</button>
+        <button id="stopBtn" disabled>Stop Recording</button>
+    </div>
+
+    <div id="chat"></div>
+    <div id="latencyBar" class="latency-bar"></div>
+
+    <script>
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const chat = document.getElementById('chat');
+        const latencyBar = document.getElementById('latencyBar');
+
+        let ws;
+        let mediaRecorder;
+        let audioCtx;
+        let nextStartTime = 0;
+        let currentAiBubble = null;
+        let sourceNodes = [];
+
+        const TOOL_LABELS = {
+            'check_availability': 'Checking Availability',
+            'book_appointment': 'Booking Appointment',
+            'reschedule_appointment': 'Rescheduling Appointment',
+            'cancel_appointment': 'Cancelling Appointment',
+            'list_appointments': 'Looking Up Appointments',
+            'get_doctor_info': 'Finding Doctors',
+        };
+
+        function formatToolResult(tool, result) {
+            if (tool === 'check_availability') {
+                if (Array.isArray(result)) {
+                    const total = result.reduce((sum, d) => sum + (d.availableSlots?.length || 0), 0);
+                    const docs = result.map(d => d.doctor?.name).filter(Boolean).join(', ');
+                    return `${total} slots found` + (docs ? ` (${docs})` : '');
+                }
+            }
+            if (tool === 'book_appointment' && result?.success) {
+                const a = result.appointment;
+                return `Booked: ${a.doctorName} on ${new Date(a.appointmentAt).toLocaleString()}`;
+            }
+            if (tool === 'cancel_appointment' && result?.success) {
+                return `Appointment #${result.cancelledAppointmentId} cancelled`;
+            }
+            if (tool === 'reschedule_appointment' && result?.success) {
+                const a = result.appointment;
+                return `Rescheduled to: ${a.doctorName} on ${new Date(a.appointmentAt).toLocaleString()}`;
+            }
+            if (tool === 'list_appointments' && Array.isArray(result)) {
+                return `${result.length} appointment(s) found`;
+            }
+            if (tool === 'get_doctor_info') {
+                if (Array.isArray(result)) return `${result.length} doctor(s) found`;
+                if (result?.name) return `Dr. ${result.name} (${result.specialty})`;
+            }
+            if (result?.error) return result.error;
+            return JSON.stringify(result).substring(0, 120);
+        }
+
+        startBtn.onclick = async () => {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            await audioCtx.resume();
+            nextStartTime = audioCtx.currentTime;
+
+            const lang = document.getElementById('langSelect').value;
+            ws = new WebSocket(`ws://localhost:3000/ws?lang=${lang}`);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = async () => {
+                console.log("Connected to backend");
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                        ws.send(e.data);
+                    }
+                };
+                mediaRecorder.start(250);
+            };
+
+            ws.onmessage = async (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    const int16Data = new Int16Array(event.data);
+                    const float32Data = new Float32Array(int16Data.length);
+                    for (let i = 0; i < int16Data.length; i++) {
+                        float32Data[i] = int16Data[i] / 32768;
+                    }
+
+                    const buffer = audioCtx.createBuffer(1, float32Data.length, 16000);
+                    buffer.copyToChannel(float32Data, 0);
+
+                    const source = audioCtx.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(audioCtx.destination);
+
+                    if (nextStartTime < audioCtx.currentTime) {
+                        nextStartTime = audioCtx.currentTime + 0.15;
+                    }
+                    source.start(nextStartTime);
+                    nextStartTime += buffer.duration;
+
+                    sourceNodes.push(source);
+                    source.onended = () => {
+                        sourceNodes = sourceNodes.filter(s => s !== source);
+                    };
+
+                } else {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === 'interrupt') {
+                        sourceNodes.forEach(node => {
+                            try { node.stop(); } catch(e) {}
+                        });
+                        sourceNodes = [];
+                        nextStartTime = audioCtx.currentTime;
+                        if (currentAiBubble) {
+                            currentAiBubble.innerText += " [Interrupted]";
+                            currentAiBubble = null;
+                        }
+                    }
+                    else if (data.type === 'transcript' && data.isFinal) {
+                        appendBubble(data.text, 'user');
+                        currentAiBubble = null;
+                    }
+                    else if (data.type === 'llm_chunk') {
+                        if (!currentAiBubble) {
+                            currentAiBubble = appendBubble(data.text, 'ai');
+                        } else {
+                            currentAiBubble.innerText += data.text;
+                        }
+                    }
+                    else if (data.type === 'tool_action') {
+                        const card = document.createElement('div');
+                        card.className = 'tool-card';
+                        card.innerHTML =
+                            '<div class="tool-header">' + (TOOL_LABELS[data.tool] || data.tool) + '</div>' +
+                            '<div class="tool-detail">' + formatToolResult(data.tool, data.result) + '</div>' +
+                            '<div class="tool-latency">' + data.latencyMs.toFixed(0) + 'ms</div>';
+                        chat.appendChild(card);
+                        chat.scrollTop = chat.scrollHeight;
+                    }
+                    else if (data.type === 'latency') {
+                        latencyBar.style.display = 'block';
+                        latencyBar.textContent = 'E2E: ' + (data.e2eMs >= 0 ? data.e2eMs.toFixed(0) + 'ms' : 'N/A') +
+                            ' | LLM: ' + (data.llmTtftMs >= 0 ? data.llmTtftMs.toFixed(0) + 'ms' : 'N/A');
+                    }
+                }
+            };
+        };
+
+        stopBtn.onclick = () => {
+            if (mediaRecorder) mediaRecorder.stop();
+            if (ws) ws.close();
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        };
+
+        function appendBubble(text, sender) {
+            const div = document.createElement('div');
+            div.className = 'bubble ' + sender;
+            div.innerText = text;
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+            return div;
+        }
+    </script>
+</body>
+</html>
