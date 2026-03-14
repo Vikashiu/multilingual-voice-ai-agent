@@ -1,34 +1,40 @@
 import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import fastifyCors from '@fastify/cors';
+import crypto from 'crypto';
 import { config } from './config/env';
 import { TranscriptionService } from './services/deepgram.service';
-import { LLMService } from './services/llm.service';
 import { TTSService } from './services/tts.service';
 import { DataService } from './services/db.service';
 import { LatencyTracer } from './services/latency.service';
 import { CampaignService } from './services/campaign.service';
-import crypto from 'crypto';
+import { ConversationService } from './services/conversation.service';
+import { LLMService } from './services/llm.service';
+import { AppointmentService } from './services/appointment.service';
+import { AgentLanguage, SessionMode } from './types/session';
 
 const fastify = Fastify({ logger: true });
 fastify.register(fastifyWebsocket);
 fastify.register(fastifyCors, { origin: true });
 
-// --- Health check ---
 fastify.get('/health', async () => {
     return { status: 'OK', message: 'Voice Agent API is running' };
 });
 
-// --- Campaign REST routes ---
 fastify.post('/api/campaigns', async (req) => {
-    const body = req.body as { name: string; type: string; targets: { patientId: number; appointmentId?: number }[] };
+    const body = req.body as {
+        name: string;
+        type: string;
+        targets: { patientId: number; appointmentId?: number }[];
+    };
+
     const campaign = await CampaignService.createCampaign(body.name, body.type, body.targets);
     return { success: true, campaign };
 });
 
 fastify.post('/api/campaigns/:id/start', async (req) => {
     const { id } = req.params as { id: string };
-    CampaignService.startCampaign(parseInt(id)).catch((err: unknown) => {
+    CampaignService.startCampaign(parseInt(id, 10)).catch((err: unknown) => {
         console.error('Campaign error:', err);
     });
     return { success: true, message: 'Campaign started' };
@@ -36,78 +42,126 @@ fastify.post('/api/campaigns/:id/start', async (req) => {
 
 fastify.get('/api/campaigns/:id/status', async (req) => {
     const { id } = req.params as { id: string };
-    const status = await CampaignService.getCampaignStatus(parseInt(id));
-    return status;
+    return CampaignService.getCampaignStatus(parseInt(id, 10));
 });
 
-// --- WebSocket voice agent ---
-fastify.register(async function (fastify) {
-    fastify.get('/ws', { websocket: true }, (socket, req) => {
-        const query = req.query as { lang?: string };
-        const lang = (query.lang as 'en' | 'hi' | 'ta') || 'en';
-        const sessionId = crypto.randomUUID();
+fastify.post('/api/sessions/outbound', async (req) => {
+    const body = req.body as {
+        patientId: number;
+        campaignId: number;
+        campaignType: string;
+        appointmentId?: number;
+    };
 
-        const transcriptionService = new TranscriptionService(lang);
-        const llmService = new LLMService(lang);
-        const ttsService = new TTSService(lang);
+    const patientContext = await AppointmentService.getPatientContext(body.patientId);
+    const language = (patientContext?.patient.preferredLanguage as AgentLanguage) || 'en';
+    const sessionId = crypto.randomUUID();
 
-        let utteranceBuffer = "";
-        let debounceTimer: NodeJS.Timeout | null = null;
+    await ConversationService.initializeSession({
+        sessionId,
+        language,
+        mode: 'outbound',
+        patientId: body.patientId,
+        campaignContext: {
+            campaignId: body.campaignId,
+            campaignType: body.campaignType,
+            appointmentId: body.appointmentId,
+        },
+    });
 
-        // Barge-in flags
+    return {
+        success: true,
+        sessionId,
+        language,
+        wsUrl: `/ws?sessionId=${sessionId}&mode=outbound`,
+    };
+});
+
+fastify.register(async function registerVoiceRoutes(app) {
+    app.get('/ws', { websocket: true }, (socket, req) => {
+        const query = req.query as {
+            lang?: AgentLanguage;
+            sessionId?: string;
+            mode?: SessionMode;
+            patientId?: string;
+            campaignId?: string;
+            campaignType?: string;
+            appointmentId?: string;
+        };
+
+        const sessionId = query.sessionId || crypto.randomUUID();
+        const requestedMode = query.mode || 'inbound';
+        const requestedLanguage = query.lang || 'en';
+
+        let utteranceBuffer = '';
         let isAiSpeaking = false;
         let interruptFlag = false;
         let ttsStartTime = 0;
-        const BARGE_IN_COOLDOWN_MS = 1500; // ignore mic for 1.5s after TTS starts (avoids picking up AI's own voice)
+        let utteranceTimer: NodeJS.Timeout | null = null;
 
-        // Store language preference in session
-        DataService.setSessionMeta(sessionId, { language: lang });
+        const FINAL_TRANSCRIPT_DEBOUNCE_MS = 140;
 
-        transcriptionService.startStream((text, isFinal) => {
-            socket.send(JSON.stringify({ type: 'transcript', text, isFinal }));
+        void (async () => {
+            const initialMemory = await ConversationService.initializeSession({
+                sessionId,
+                language: requestedLanguage,
+                mode: requestedMode,
+                patientId: query.patientId ? parseInt(query.patientId, 10) : undefined,
+                campaignContext: query.campaignId && query.campaignType
+                    ? {
+                        campaignId: parseInt(query.campaignId, 10),
+                        campaignType: query.campaignType,
+                        appointmentId: query.appointmentId ? parseInt(query.appointmentId, 10) : undefined,
+                    }
+                    : undefined,
+            });
 
-            // Barge-in: user speaks while AI is talking, but only after cooldown
-            // (prevents AI's own TTS voice from being picked up by the mic)
-            if (text.trim().length > 0 && isAiSpeaking && Date.now() - ttsStartTime > BARGE_IN_COOLDOWN_MS) {
-                interruptFlag = true;
-                socket.send(JSON.stringify({ type: 'interrupt' }));
-                console.log("Barge-in detected! Interrupting AI.");
-            }
+            await DataService.setSessionMeta(sessionId, {
+                language: initialMemory.language,
+                mode: initialMemory.mode,
+                ...(initialMemory.patientId ? { patient_id: String(initialMemory.patientId) } : {}),
+            });
 
-            // Reset debounce on any speech
-            if (text.trim().length > 0) {
-                if (debounceTimer) {
-                    clearTimeout(debounceTimer);
-                    debounceTimer = null;
+            const transcriptionService = new TranscriptionService(initialMemory.language);
+            const ttsService = new TTSService(initialMemory.language);
+            const llmService = new LLMService({
+                sessionId,
+                language: initialMemory.language,
+                mode: initialMemory.mode,
+                patientId: initialMemory.patientId,
+                patientName: initialMemory.patientName,
+            });
+
+            const triggerUtterance = () => {
+                if (!utteranceBuffer.trim() || isAiSpeaking) {
+                    return;
                 }
-            }
 
-            if (isFinal && text.trim().length > 0) {
-                utteranceBuffer += " " + text.trim();
+                const fullSentence = utteranceBuffer.trim();
+                utteranceBuffer = '';
 
-                debounceTimer = setTimeout(async () => {
-                    const fullSentence = utteranceBuffer.trim();
-                    if (fullSentence.length === 0) return;
-                    utteranceBuffer = "";
+                if (utteranceTimer) {
+                    clearTimeout(utteranceTimer);
+                    utteranceTimer = null;
+                }
 
-                    isAiSpeaking = true;
-                    interruptFlag = false;
+                isAiSpeaking = true;
+                interruptFlag = false;
+                ttsStartTime = Date.now();
 
-                    console.log('--- Triggering LLM with:', fullSentence);
+                const tracer = new LatencyTracer(sessionId);
+                tracer.sttEnd();
 
-                    // Latency tracking
-                    const tracer = new LatencyTracer(sessionId);
-                    tracer.sttEnd();
-
+                void (async () => {
                     try {
-                        let ttsBuffer = "";
+                        let ttsBuffer = '';
                         let isFirstChunk = true;
                         let isFirstTTSByte = true;
+                        let ttsPromise = Promise.resolve();
 
                         await llmService.generateResponse(
                             sessionId,
                             fullSentence,
-                            // onChunk: stream text to TTS
                             async (llmChunk) => {
                                 if (interruptFlag) return;
 
@@ -116,91 +170,139 @@ fastify.register(async function (fastify) {
                                     isFirstChunk = false;
                                 }
 
-                                socket.send(JSON.stringify({ type: 'llm_chunk', text: llmChunk }));
+                                socket.send(JSON.stringify({ type: 'llm_chunk', sessionId, text: llmChunk }));
                                 ttsBuffer += llmChunk;
 
-                                // Split on sentence boundaries (including Hindi purna viram)
-                                if (/[.!?\n।॥]/.test(llmChunk)) {
+                                if (/[.!?\n?]/.test(llmChunk)) {
                                     const phraseToSpeak = ttsBuffer.trim();
-                                    ttsBuffer = "";
+                                    ttsBuffer = '';
 
-                                    // Allow any non-whitespace content (fixes Hindi/Tamil bug)
-                                    if (/\S/.test(phraseToSpeak)) {
+                                    if (!/\S/.test(phraseToSpeak)) {
+                                        return;
+                                    }
+
+                                    ttsPromise = ttsPromise.then(async () => {
                                         if (interruptFlag) return;
 
                                         await ttsService.streamSpeech(phraseToSpeak, (audioBuffer) => {
-                                            if (!interruptFlag) {
-                                                if (isFirstTTSByte) {
-                                                    ttsStartTime = Date.now();
-                                                    tracer.ttsFirstByte();
-                                                    isFirstTTSByte = false;
-                                                }
-                                                socket.send(audioBuffer);
+                                            if (interruptFlag) return;
+                                            if (isFirstTTSByte) {
+                                                ttsStartTime = Date.now();
+                                                tracer.ttsFirstByte();
+                                                isFirstTTSByte = false;
                                             }
+                                            socket.send(audioBuffer);
                                         });
-                                    }
+                                    });
                                 }
                             },
-                            // onToolAction: send reasoning trace to frontend
                             (toolAction) => {
-                                socket.send(JSON.stringify({
-                                    type: 'tool_action',
-                                    tool: toolAction.tool,
-                                    args: toolAction.args,
-                                    result: toolAction.result,
-                                    latencyMs: toolAction.latencyMs,
-                                }));
+                                socket.send(
+                                    JSON.stringify({
+                                        type: 'tool_action',
+                                        sessionId,
+                                        tool: toolAction.tool,
+                                        args: toolAction.args,
+                                        result: toolAction.result,
+                                        latencyMs: toolAction.latencyMs,
+                                    }),
+                                );
                             },
-                            // isInterrupted
                             () => interruptFlag,
                         );
 
-                        // Speak final fragment
                         if (/\S/.test(ttsBuffer.trim()) && !interruptFlag) {
-                            await ttsService.streamSpeech(ttsBuffer.trim(), (audioBuffer) => {
-                                if (!interruptFlag) {
-                                    if (isFirstTTSByte) {
-                                        ttsStartTime = Date.now();
-                                        tracer.ttsFirstByte();
-                                        isFirstTTSByte = false;
+                            const finalPhrase = ttsBuffer.trim();
+                            ttsPromise = ttsPromise.then(async () => {
+                                if (interruptFlag) return;
+                                await ttsService.streamSpeech(finalPhrase, (audioBuffer) => {
+                                    if (!interruptFlag) {
+                                        socket.send(audioBuffer);
                                     }
-                                    socket.send(audioBuffer);
-                                }
+                                });
                             });
                         }
 
-                        // Log latency and send to frontend
+                        await ttsPromise;
+
                         const latencyReport = tracer.report();
                         if (latencyReport) {
-                            socket.send(JSON.stringify({
-                                type: 'latency',
-                                ...latencyReport,
-                            }));
+                            socket.send(
+                                JSON.stringify({
+                                    type: 'latency',
+                                    sessionId,
+                                    ...latencyReport,
+                                }),
+                            );
                         }
-
-                    } catch (e) {
-                        console.error("LLM Error:", e);
+                    } catch (error) {
+                        console.error('LLM error:', error);
                     } finally {
                         isAiSpeaking = false;
                     }
-                }, 1500);
-            }
-        });
+                })();
+            };
 
-        socket.on('message', (message: Buffer) => {
-            transcriptionService.sendAudio(message);
-        });
+            transcriptionService.startStream((text, isFinal, speechFinal) => {
+                socket.send(
+                    JSON.stringify({
+                        type: 'transcript',
+                        sessionId,
+                        text,
+                        isFinal,
+                        speechFinal,
+                    }),
+                );
 
-        socket.on('close', async () => {
-            if (debounceTimer) clearTimeout(debounceTimer);
-            transcriptionService.closeStream();
-            ttsService.close();
-            try {
-                await DataService.archiveSession(sessionId);
-            } catch (error) {
-                console.error('Failed to archive session:', error);
-            }
-        });
+                if (isFinal && text.trim().length > 0) {
+                    utteranceBuffer += ` ${text.trim()}`;
+
+                    if (utteranceTimer) {
+                        clearTimeout(utteranceTimer);
+                    }
+
+                    utteranceTimer = setTimeout(() => {
+                        triggerUtterance();
+                    }, FINAL_TRANSCRIPT_DEBOUNCE_MS);
+                }
+
+                if (speechFinal) {
+                    triggerUtterance();
+                }
+            });
+
+            socket.on('message', (message: Buffer) => {
+                if (isAiSpeaking) {
+                    return;
+                }
+                transcriptionService.sendAudio(message);
+            });
+
+            socket.on('close', async () => {
+                if (utteranceTimer) {
+                    clearTimeout(utteranceTimer);
+                    utteranceTimer = null;
+                }
+
+                transcriptionService.closeStream();
+                ttsService.close();
+
+                try {
+                    await DataService.archiveSession(sessionId);
+                } catch (error) {
+                    console.error('Failed to archive session:', error);
+                }
+            });
+
+            socket.send(
+                JSON.stringify({
+                    type: 'session_ready',
+                    sessionId,
+                    language: initialMemory.language,
+                    mode: initialMemory.mode,
+                }),
+            );
+        })();
     });
 });
 

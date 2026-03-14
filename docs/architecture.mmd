@@ -1,0 +1,25 @@
+flowchart LR
+    Client[Voice Client or Telephony Adapter]
+    WS[Fastify WebSocket /ws]
+    STT[Deepgram Live STT]
+    LLM[Groq-hosted LLM]
+    TTS[Cartesia Streaming TTS]
+    Redis[(Redis TTL Memory)]
+    Postgres[(Postgres)]
+    Tools[Appointment Tools]
+    Campaigns[Outbound Campaign Session Bootstrap]
+
+    Client -->|audio chunks| WS
+    WS --> STT
+    STT -->|final transcript| LLM
+    LLM -->|token stream| WS
+    WS --> TTS
+    TTS -->|audio stream| Client
+
+    LLM <--> Redis
+    LLM <--> Postgres
+    LLM --> Tools
+    Tools <--> Postgres
+    Campaigns --> Redis
+    Campaigns --> Postgres
+    Campaigns --> WS

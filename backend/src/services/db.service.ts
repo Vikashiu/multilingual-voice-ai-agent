@@ -2,6 +2,7 @@ import Redis from 'ioredis';
 import { db } from '../db';
 import { chatArchives } from '../db/schema';
 import { config } from '../config/env';
+import { SessionMemory } from '../types/session';
 
 export const redis = new Redis(config.REDIS_URL || 'redis://localhost:6379');
 
@@ -17,6 +18,18 @@ export class DataService {
     static async getChatHistory(sessionId: string) {
         const messages = await redis.lrange(`chat:${sessionId}`, 0, -1);
         return messages.map(m => JSON.parse(m));
+    }
+
+    // --- REDIS: Structured session memory ---
+
+    static async setSessionMemory(sessionId: string, memory: SessionMemory) {
+        const key = `session-memory:${sessionId}`;
+        await redis.set(key, JSON.stringify(memory), 'EX', 3600);
+    }
+
+    static async getSessionMemory(sessionId: string): Promise<SessionMemory | null> {
+        const data = await redis.get(`session-memory:${sessionId}`);
+        return data ? JSON.parse(data) : null;
     }
 
     // --- REDIS: Session metadata (patient identity, language, etc.) ---
@@ -37,18 +50,31 @@ export class DataService {
 
     static async archiveSession(sessionId: string) {
         const history = await redis.lrange(`chat:${sessionId}`, 0, -1);
+        const memory = await DataService.getSessionMemory(sessionId);
         if (history.length > 0) {
             const parsedHistory = history.map(m => JSON.parse(m));
 
             await db.insert(chatArchives)
-                .values({ sessionId, transcript: parsedHistory })
+                .values({
+                    sessionId,
+                    transcript: {
+                        messages: parsedHistory,
+                        memory,
+                    },
+                })
                 .onConflictDoUpdate({
                     target: chatArchives.sessionId,
-                    set: { transcript: parsedHistory }
+                    set: {
+                        transcript: {
+                            messages: parsedHistory,
+                            memory,
+                        },
+                    }
                 });
-
-            await redis.del(`chat:${sessionId}`);
-            await redis.del(`session:${sessionId}`);
         }
+
+        await redis.del(`chat:${sessionId}`);
+        await redis.del(`session:${sessionId}`);
+        await redis.del(`session-memory:${sessionId}`);
     }
 }

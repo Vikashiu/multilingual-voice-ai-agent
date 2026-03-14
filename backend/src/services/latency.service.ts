@@ -1,6 +1,7 @@
 export class LatencyTracer {
     private marks: Map<string, number> = new Map();
     private sessionId: string;
+    private readonly targetBudgetMs = 450;
 
     constructor(sessionId: string) {
         this.sessionId = sessionId;
@@ -37,7 +38,8 @@ export class LatencyTracer {
             `[LATENCY] Session ${this.sessionId.slice(0, 8)} | ` +
             `E2E: ${e2eMs >= 0 ? e2eMs.toFixed(0) + 'ms' : 'N/A'} | ` +
             `LLM TTFT: ${llmTtftMs >= 0 ? llmTtftMs.toFixed(0) + 'ms' : 'N/A'} | ` +
-            `TTS TTFB: ${ttsTtfbMs >= 0 ? ttsTtfbMs.toFixed(0) + 'ms' : 'N/A'}`
+            `TTS TTFB: ${ttsTtfbMs >= 0 ? ttsTtfbMs.toFixed(0) + 'ms' : 'N/A'} | ` +
+            `Target ${this.targetBudgetMs}ms: ${e2eMs >= 0 && e2eMs <= this.targetBudgetMs ? 'PASS' : 'MISS'}`
         );
 
         return { e2eMs, llmTtftMs, ttsTtfbMs };
